@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// Regression test for issue #620:
+// https://github.com/multipath-tcp/mptcp_net-next/issues/620
+//
+// Removing the endpoint linked to the initial subflow with ID 0 used to skip
+// cancelling a pending ADD_ADDR announcement: the anno_list entry was left
+// alive and add_addr_signaled was not decremented. A later PM reselection
+// would then re-announce that address and trip WARN_ON_ONCE() in
+// mptcp_pm_announced_alloc().
+//
+// The 'signal' endpoint is added after the connection is established, so
+// mptcp_mpc_endpoint_setup() has already run without clearing its bit: the
+// address is then announced with ID 0. It is removed with "delete id 0", and
+// the PM counter is checked: it must be back to 0.
+
+--tolerance_usecs=100000
+`../common/defaults.sh
+ sysctl -wq net.mptcp.add_addr_timeout=0
+ sysctl -wq net.ipv4.tcp_timestamps=0`
+
++0    `../common/multi-ep.sh -e 1 -m subflow`
+
++0.0  socket(..., SOCK_STREAM, IPPROTO_MPTCP) = 3
++0.0  setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
++0.0  fcntl(3, F_GETFL) = 0x2 (flags O_RDWR)
++0.0  fcntl(3, F_SETFL, O_RDWR|O_NONBLOCK) = 0
++0    bind(3, ..., ...) = 0
++0    listen(3, 1) = 0
+
+// ---- MPC handshake ----
++0.1  <  addr[caddr0] > addr[saddr0]  S   0:0(0)               win 65535  <mss 1460, nop, nop, sackOK, nop, wscale 8, mpcapable v1 flags[flag_h] nokey>
++0.0  >                               S.  0:0(0)      ack 1               <mss 1460, nop, nop, sackOK, nop, wscale 8, mpcapable v1 flags[flag_h] key[skey]>
++0.2  <                                .  1:1(0)      ack 1    win 256    <                                           mpcapable v1 flags[flag_h] key[ckey=2, skey]>
++0    accept(3, ..., ...) = 4
+
++0.0  <                               P.  1:3(2)      ack 1    win 256    <mpcapable v1 flags[flag_h] key[skey, ckey] mpcdatalen 2, nop, nop>
++0.0  >                                .  1:1(0)      ack 3               <dss dack8=3 dll=0 nocs>
+
+// ---- kernel-initiated subflow from the 'subflow' endpoint ----
++0~+0.5  >  addr[saddr1] > addr[caddr0]  S  0:0(0)                        <mss 1460, nop, nop, sackOK, nop, wscale 8, mp_join_syn     address_id=1 token=sha256_32(ckey)>
++0.0     <                               S. 0:0(0)      ack 1  win 65535  <mss 1460, nop, nop, sackOK, nop, wscale 8, mp_join_syn_ack address_id=0 sender_hmac=auto>
++0.0     >                                . 1:1(0)      ack 1             <                                           mp_join_ack                  sender_hmac=auto>
++0.0     <                                . 1:1(0)      ack 1  win 256    <dss dack8=3 nocs>
+
+// ---- add the 'signal' endpoint: announced with ID 0, echo withheld ----
++0.5  `ip mptcp endpoint add $OPT_LOCAL_IP signal`
++0~+0.5  >  addr[saddr0] > addr[caddr0]  . 1:1(0)       ack 3             <add_address address_id=0 addr[saddr0] hmac=auto>
+
+// ---- remove it with ID 0: the pending ADD_ADDR must be cancelled ----
++0.5  `ip mptcp endpoint delete id 0 $OPT_LOCAL_IP`
++0~+0.5  >  addr[saddr1] > addr[caddr0]  . 1:1(0)       ack 1             <...> // TODO: use this when RM_ADDR is supported: <dss dack8=3 nocs, remove_address address_id=[0]>
++0.0  `ss -inmHM | grep -q "add_addr_signal:[1-9]" && { echo "BUG: add_addr_signaled not decremented after delete id 0" >&2; exit 1; }; exit 0`
