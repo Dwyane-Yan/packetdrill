@@ -2,6 +2,10 @@
 --tolerance_usecs=200000
 `../common/defaults.sh`
 
+// tcp_rto_max_ms (set to its minimum) caps the MPTCP-level backoff at
+// rto_min << ilog2(rto_max / rto_min) = 200ms << 2 = 800ms
++0     `sysctl -wq net.ipv4.tcp_rto_max_ms=1000`
+
 +0     socket(..., SOCK_STREAM, IPPROTO_MPTCP) = 3
 +0     setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
 
@@ -16,10 +20,12 @@
 +0     close(4) = 0
 +0       >   .  1:1(0)  ack 1             <dss dack4=1 dsn8=1 ssn=0 dll=1 nocs fin, nop, nop>
 
-// wait for retransmissions
+// wait for retransmissions: the interval stops doubling at 800ms
 +0.2~+0.3 >  .  1:1(0)  ack 1             <dss dack4=1 dsn8=1 ssn=0 dll=1 nocs fin, nop, nop>
 +0.2~+0.3 >  .  1:1(0)  ack 1             <dss dack4=1 dsn8=1 ssn=0 dll=1 nocs fin, nop, nop>
 +0.4~+0.5 >  .  1:1(0)  ack 1             <dss dack4=1 dsn8=1 ssn=0 dll=1 nocs fin, nop, nop>
++0.8~+0.9 >  .  1:1(0)  ack 1             <dss dack4=1 dsn8=1 ssn=0 dll=1 nocs fin, nop, nop>
++0.8~+0.9 >  .  1:1(0)  ack 1             <dss dack4=1 dsn8=1 ssn=0 dll=1 nocs fin, nop, nop>
 
 // ACK the data_fin
 +0       <   .  2:2(0)  ack 1  win 450    <dss dack4=2 dsn8=1 ssn=0 dll=1 nocs fin, nop, nop>
