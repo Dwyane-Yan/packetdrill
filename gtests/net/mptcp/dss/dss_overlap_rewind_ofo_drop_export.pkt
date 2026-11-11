@@ -1,0 +1,104 @@
+// Regression test for a Medium-severity issue reported by an AI review on
+// v23 of the "mptcp: remove CB offset field" series:
+//
+//   https://patchwork.kernel.org/project/mptcp/patch/bf2faa4c21a3faf79fece4448402bfd726fbf9e4.1793969127.git.tanggeliang@kylinos.cn/
+//
+// When a TCP subflow queues a partially overlapping segment that starts
+// inside the current DSS mapping, offset is positive while
+// before(ssn, map_subflow_seq) is false, so the already-consumed prefix
+// skb[0..offset) is not pulled.  If mptcp_init_skb() then rewinds map_seq
+// by offset (mapped_dsn - offset), that prefix — never checked by
+// validate_data_csum(), which starts at tp->copied_seq — gains a valid
+// DSN identity, takes part in the OoO overlap handling and is finally
+// delivered to user space.
+//
+// Timeline (DSN/SSN offsets relative to the peer IDSN, first data byte = 1):
+//
+//   MPC sf0: TCP [1,3)    2B   implicit map, DSN [1,3)
+//   A   sf0: TCP [3,103)  100B map A: dsn=1000 ssn=3  dll=100 -> OOO [1000,1100)
+//   B   sf1: TCP [1,101)  100B map  : dsn=503  ssn=1  dll=100 -> OOO skb1 [503,603)
+//   C   sf0: TCP [73,473) 400B map B: dsn=203  ssn=53 dll=420
+//            partial overlap (73 < rcv_nxt 103 < 473): TCP queues it
+//            untrimmed and reports DSACK [73,103); offset = 30, skb start
+//            inside map B -> no pull; with the rewind, the label becomes
+//            [223,623), which covers skb1 -> merge_right drops the
+//            previously validated skb1
+//   D   sf1: TCP [101,321) 220B map: dsn=3 ssn=101 dll=220 -> DSN [3,223)
+//
+// Correct receiver (mainline, CB->offset accounting): C is labeled
+// [253,623) and stays in the OoO queue after D fills the DSN gap up to
+// 223: the OoO head starts at 253 > ack_seq 223, so DACK stays at 223
+// and splice() returns only the 222 bytes actually queued, then EAGAIN.
+//
+// Rewinding receiver (v23): C is labeled [223,623) and admitted at ack
+// 223 with delta 0: DACK jumps to 623 — 30 DSNs never received are
+// acknowledged — and splice() delivers 622 bytes including the
+// unvalidated 30-byte prefix.
+--tolerance_usecs=100000
+`../common/defaults.sh`
+
++0    `../common/multi-ep.sh -e 0`
++0    `: > /dev/shm/mptcp_recv_export.bin`
+
++0.0  socket(..., SOCK_STREAM, IPPROTO_MPTCP) = 3
++0.0  setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
++0.0  fcntl(3, F_GETFL) = 0x2 (flags O_RDWR)
++0.0  fcntl(3, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+
++0    bind(3, ..., ...) = 0
++0    listen(3, 1) = 0
+
+// MP_CAPABLE
++0.0    <  addr[caddr0] > addr[saddr0]  S   0:0(0)         win 65535  <mss 1460, nop, nop, sackOK, nop, wscale 8, mpcapable v1 flags[flag_h] nokey>
+// NOTE: MSS here follows the live kernel's advertised value under run_all.py
+// (1460 in the current env).  Running the raw packetdrill binary directly may
+// advertise 1440 instead — it is a link parameter, not part of the behavior
+// under test.  Always run both AB sides the same way (run_all.py).
++0.0    >                               S.  0:0(0)  ack 1             <mss 1460, nop, nop, sackOK, nop, wscale 8, mpcapable v1 flags[flag_h] key[skey]>
++0.1    <                                .  1:1(0)  ack 1  win 256    <                                           mpcapable v1 flags[flag_h] key[ckey=2, skey]>
++0    accept(3, ..., ...) = 4
+// the accepted socket must be non-blocking: the export behavior is a
+// PARTIAL read (222 of 622 bytes) — a blocking splice would wait forever
++0    fcntl(4, F_GETFL) = 0x2 (flags O_RDWR)
++0    fcntl(4, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+
+// MP_CAPABLE carrying 2 data bytes (DSN/SSN 1..3)
++0.0    <                                P.  1:3(2)  ack 1  win 256    <mpcapable v1 flags[flag_h] key[skey, ckey] mpcdatalen 2, nop, nop>
++0.0    >                                .  1:1(0)  ack 3             <dss dack8=3 dll=0 nocs>
+
+// second subflow
++0.1    <  addr[caddr1] > addr[saddr0]  S   0:0(0)         win 65535  <mss 1460, nop, nop, sackOK, nop, wscale 8, mp_join_syn     address_id=1 token=sha256_32(skey)>
++0.0    >                               S.  0:0(0)  ack 1             <mss 1460, nop, nop, sackOK, nop, wscale 8, mp_join_syn_ack address_id=1 sender_hmac=auto>
++0.1    <                                .  1:1(0)  ack 1  win 256                                               <mp_join_ack                  sender_hmac=auto>
++0.0    >                                .  1:1(0)  ack 1             <dss dack8=3 nocs>
+
+// A: sf0 100B, map A -> OOO node [1000,1100); sf0 copied_seq = 103
++0.1    <  addr[caddr0] > addr[saddr0]  P.  3:103(100)  ack 1  win 256  <dss dack8=1 dsn8=1000 ssn=3 dll=100 nocs, nop, nop>
++0.0    >  addr[saddr0] > addr[caddr0]  .  1:1(0)  ack 103             <dss dack8=3 dll=0 nocs>
+
+// B: sf1 100B -> OOO skb1 [503,603), the validated node that gets deduped
++0.1    <  addr[caddr1] > addr[saddr0]  P.  1:101(100)  ack 1  win 256  <dss dack8=1 dsn8=503 ssn=1 dll=100 nocs, nop, nop>
++0.0    >  addr[saddr0] > addr[caddr1]  .  1:1(0)  ack 101             <dss dack8=3 dll=0 nocs>
+
+// C: sf0 partially overlapping segment (seq 73 < rcv_nxt 103 < 473),
+//    inside map B -> NO pull, export label [253,623), merge_right drops skb1.
+//    TCP reports the duplicate range as a DSACK block on the ACK.
++0.1    <  addr[caddr0] > addr[saddr0]  P.  73:473(400)  ack 1  win 256  <dss dack8=1 dsn8=203 ssn=53 dll=420 nocs, nop, nop>
++0.0    >  addr[saddr0] > addr[caddr0]  .  1:1(0)  ack 473             <nop, nop, sack 73:103, dss dack8=3 dll=0 nocs>
+
+// D: sf1 fills the DSN gap [3,223).  EXPORT behavior: the OOO head C
+//    starts at 253 > ack 223 -> not moved, DACK stays at 223.
+//    (v23 rewinds C's label to 223 == ack -> delivers it -> DACK 623)
++0.1    <  addr[caddr1] > addr[saddr0]  P.  101:321(220)  ack 1  win 256  <dss dack8=1 dsn8=3 ssn=101 dll=220 nocs, nop, nop>
++0.0    >  addr[saddr0] > addr[caddr1]  .  1:1(0)  ack 321             <dss dack8=223 dll=0 nocs>
+
+// EXPORT behavior: only 222 bytes are deliverable (MPC 2 + D 220);
+// the 30 DSNs [223,253) honestly wait for data nobody ever sends.
++0.5  open("/dev/shm/mptcp_recv_export.bin", O_WRONLY) = 7
++0    pipe([5, 6]) = 0
++0    splice(4, NULL, 6, NULL, 622, 0) = 222
++0    splice(4, NULL, 6, NULL, 1, 0) = -1 EAGAIN (Resource temporarily unavailable)
++0    splice(5, NULL, 7, NULL, 222, 0) = 222
++0    close(7) = 0
++0    close(5) = 0
++0    close(6) = 0
