@@ -148,6 +148,21 @@ struct packet *new_tcp_packet(int address_family,
 	packet = packet_new(ip_bytes);
 	memset(packet->buffer, 0, ip_bytes);
 
+	/* Fill the payload of injected (inbound) packets with a pattern
+	 * derived from the script's relative sequence number, so receivers
+	 * can verify the delivered stream byte-exactly. Outbound script
+	 * packets keep the all-zero payload: they mirror what a kernel
+	 * write() of zeroes produces and are compared against live packets.
+	 */
+	if (direction == DIRECTION_INBOUND) {
+		u8 *payload = packet->buffer + ip_header_bytes +
+			      tcp_header_bytes;
+		int i;
+
+		for (i = 0; i < tcp_payload_bytes; i++)
+			payload[i] = (u8)(start_sequence + i);
+	}
+
 	packet->direction = direction;
 	packet->flags = 0;
 	packet->tos_chk = ip_info.tos.check;
